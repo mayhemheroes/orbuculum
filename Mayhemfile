@@ -1,0 +1,6 @@
+project: rnshah9/orbuculum
+target: orbuculum
+
+cmds:
+  - cmd: /repo/ofiles/orbstat -e @@
+    filepath: /test.elf
