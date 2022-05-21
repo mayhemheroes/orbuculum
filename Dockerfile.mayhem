@@ -1,0 +1,9 @@
+FROM --platform=linux/amd64 ubuntu:20.04
+
+RUN apt-get update
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y libusb-1.0-0-dev libbfd-dev libelf-dev libftdi1-dev git libiberty-dev build-essential
+
+ADD . /repo
+WORKDIR /repo
+RUN make get_version
+RUN make 
