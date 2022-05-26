@@ -1,5 +1,5 @@
 project: rnshah9/orbuculum
-target: orbuculum
+target: orbstat
 
 cmds:
   - cmd: /repo/ofiles/orbstat -e @@
