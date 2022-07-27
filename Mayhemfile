@@ -2,5 +2,4 @@ project: orbuculum
 target: orbstat
 
 cmds:
-  - cmd: /repo/ofiles/orbstat -e /test.elf
-    filepath: /test.elf
+  - cmd: /orbstat -e @@
