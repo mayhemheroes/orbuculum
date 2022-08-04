@@ -1,76 +1,27 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 /*
- * SWO Catter for Blackmagic Probe and TTL Serial Interfaces
- * =========================================================
+ * ITM Catter for Orbuculum
+ * ========================
  *
- * Copyright (C) 2017, 2019  Dave Marples  <dave@marples.net>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- * * Redistributions of source code must retain the above copyright
- *   notice, this list of conditions and the following disclaimer.
- * * Redistributions in binary form must reproduce the above copyright
- *   notice, this list of conditions and the following disclaimer in the
- *   documentation and/or other materials provided with the distribution.
- * * Neither the names Orbtrace, Orbuculum nor the names of its
- *   contributors may be used to endorse or promote products derived from
- *   this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
- * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
  */
 
-#include <strings.h>
 #include <stdlib.h>
-#include <stdbool.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <ctype.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
-#if defined OSX
-    #include <libusb.h>
-#else
-    #if defined LINUX
-        #include <libusb-1.0/libusb.h>
-    #else
-        #error "Unknown OS"
-    #endif
-#endif
-#include <stdint.h>
 #include <inttypes.h>
-#include <limits.h>
-#include <termios.h>
-#include <pthread.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
+#include <getopt.h>
 
+#include "nw.h"
 #include "git_version_info.h"
 #include "generics.h"
 #include "tpiuDecoder.h"
 #include "itmDecoder.h"
 #include "msgDecoder.h"
-
-#define SERVER_PORT 3443                  /* Server port definition */
-
-#define TRANSFER_SIZE (4096)
+#include "stream.h"
 #define NUM_CHANNELS  32
 #define HW_CHANNEL    (NUM_CHANNELS)      /* Make the hardware fifo on the end of the software ones */
 
@@ -81,7 +32,7 @@ struct
 {
     /* Config information */
     bool useTPIU;
-    uint32_t tpiuITMChannel;
+    uint32_t tpiuChannel;
     bool forceITMSync;
     uint32_t hwOutputs;
 
@@ -94,7 +45,8 @@ struct
 
     char *file;                                          /* File host connection */
     bool endTerminate;                                  /* Terminate when file/socket "ends" */
-} options = {.forceITMSync = true, .tpiuITMChannel = 1, .port = SERVER_PORT, .server = "localhost"};
+
+} options = {.forceITMSync = true, .tpiuChannel = 1, .port = NWCLIENT_SERVER_PORT, .server = "localhost"};
 
 struct
 {
@@ -350,7 +302,7 @@ void _protocolPump( uint8_t c )
 
                 for ( uint32_t g = 0; g < _r.p.len; g++ )
                 {
-                    if ( _r.p.packet[g].s == options.tpiuITMChannel )
+                    if ( _r.p.packet[g].s == options.tpiuChannel )
                     {
                         _itmPumpProcess( _r.p.packet[g].d );
                         continue;
@@ -358,7 +310,7 @@ void _protocolPump( uint8_t c )
 
                     if  ( _r.p.packet[g].s != 0 )
                     {
-                        genericsReport( V_WARN, "Unknown TPIU channel %02x" EOL, _r.p.packet[g].s );
+                        genericsReport( V_DEBUG, "Unknown TPIU channel %02x" EOL, _r.p.packet[g].s );
                     }
                 }
 
@@ -375,31 +327,50 @@ void _protocolPump( uint8_t c )
     }
 }
 // ====================================================================================================
-void _printHelp( char *progName )
+void _printHelp( const char *const progName )
 
 {
-    fprintf( stdout, "Usage: %s <htv> <-i channel> <-p port> <-s server>" EOL, progName );
-    fprintf( stdout, "       c: <Number>,<Format> of channel to add into output stream (repeat per channel)" EOL );
-    fprintf( stdout, "       e: Terminate when the file/socket ends/is closed, or attempt to wait for more / reconnect" EOL );
-    fprintf( stdout, "       f: <filename> Take input from specified file" EOL );
-    fprintf( stdout, "       h: This help" EOL );
-    fprintf( stdout, "       i: <channel> Set ITM Channel in TPIU decode (defaults to 1)" EOL );
-    fprintf( stdout, "       n: Enforce sync requirement for ITM (i.e. ITM needsd to issue syncs)" EOL );
-    fprintf( stdout, "       s: <Server>:<Port> to use" EOL );
-    fprintf( stdout, "       t: Use TPIU decoder" EOL );
-    fprintf( stdout, "       v: <level> Verbose mode 0(errors)..3(debug)" EOL );
+    fprintf( stdout, "Usage: %s [options]" EOL, progName );
+    fprintf( stdout, "    -c, --channel:      <Number>,<Format> of channel to add into output stream (repeat per channel)" EOL );
+    fprintf( stdout, "    -E, --eof:          Terminate when the file/socket ends/is closed, or attempt to wait for more / reconnect" EOL );
+    fprintf( stdout, "    -f, --input-file:   <filename> Take input from specified file" EOL );
+    fprintf( stdout, "    -h, --help:         This help" EOL );
+    fprintf( stdout, "    -n, --itm-sync:     Enforce sync requirement for ITM (i.e. ITM needsd to issue syncs)" EOL );
+    fprintf( stdout, "    -s, --server:       <Server>:<Port> to use" EOL );
+    fprintf( stdout, "    -t, --tpiu:         <channel>: Use TPIU decoder on specified channel (normally 1)" EOL );
+    fprintf( stdout, "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
+    fprintf( stdout, "    -V, --version:      Print version and exit" EOL );
 }
 // ====================================================================================================
-int _processOptions( int argc, char *argv[] )
+void _printVersion( void )
 
 {
-    int c;
-    char *chanConfig;
-    uint chan;
+    genericsPrintf( "orbcat version " GIT_DESCRIBE EOL );
+}
+// ====================================================================================================
+static struct option _longOptions[] =
+{
+    {"channel", required_argument, NULL, 'c'},
+    {"eof", no_argument, NULL, 'E'},
+    {"input-file", required_argument, NULL, 'f'},
+    {"help", no_argument, NULL, 'h'},
+    {"itm-sync", no_argument, NULL, 'n'},
+    {"server", required_argument, NULL, 's'},
+    {"tpiu", required_argument, NULL, 't'},
+    {"verbose", required_argument, NULL, 'v'},
+    {"version", no_argument, NULL, 'V'},
+    {NULL, no_argument, NULL, 0}
+};
+// ====================================================================================================
+bool _processOptions( int argc, char *argv[] )
+
+{
+    int c, optionIndex = 0;
+    unsigned int chan;
     char *chanIndex;
 #define DELIMITER ','
 
-    while ( ( c = getopt ( argc, argv, "c:ef:hi:ns:tv:" ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "c:Ef:hVns:t:v:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
@@ -408,18 +379,18 @@ int _processOptions( int argc, char *argv[] )
                 return false;
 
             // ------------------------------------
-            case 'e':
+            case 'V':
+                _printVersion();
+                return false;
+
+            // ------------------------------------
+            case 'E':
                 options.endTerminate = true;
                 break;
 
             // ------------------------------------
             case 'f':
                 options.file = optarg;
-                break;
-
-            // ------------------------------------
-            case 'i':
-                options.tpiuITMChannel = atoi( optarg );
                 break;
 
             // ------------------------------------
@@ -447,7 +418,7 @@ int _processOptions( int argc, char *argv[] )
 
                 if ( !options.port )
                 {
-                    options.port = SERVER_PORT;
+                    options.port = NWCLIENT_SERVER_PORT;
                 }
 
                 break;
@@ -455,6 +426,7 @@ int _processOptions( int argc, char *argv[] )
             // ------------------------------------
             case 't':
                 options.useTPIU = true;
+                options.tpiuChannel = atoi( optarg );
                 break;
 
             // ------------------------------------
@@ -465,7 +437,8 @@ int _processOptions( int argc, char *argv[] )
             // ------------------------------------
             /* Individual channel setup */
             case 'c':
-                chanIndex = chanConfig = strdup( optarg );
+                chanIndex = optarg;
+
                 chan = atoi( optarg );
 
                 if ( chan >= NUM_CHANNELS )
@@ -509,14 +482,13 @@ int _processOptions( int argc, char *argv[] )
                 // ------------------------------------
         }
 
-    if ( ( options.useTPIU ) && ( !options.tpiuITMChannel ) )
+    if ( ( options.useTPIU ) && ( !options.tpiuChannel ) )
     {
         genericsReport( V_ERROR, "TPIU set for use but no channel set for ITM output" EOL );
         return false;
     }
 
-    genericsReport( V_INFO, "orbcat V" VERSION " (Git %08X %s, Built " BUILD_DATE EOL, GIT_HASH, ( GIT_DIRTY ? "Dirty" : "Clean" ) );
-
+    genericsReport( V_INFO, "orbcat version " GIT_DESCRIBE EOL );
     genericsReport( V_INFO, "Server     : %s:%d" EOL, options.server, options.port );
     genericsReport( V_INFO, "ForceSync  : %s" EOL, options.forceITMSync ? "true" : "false" );
 
@@ -537,7 +509,7 @@ int _processOptions( int argc, char *argv[] )
 
     if ( options.useTPIU )
     {
-        genericsReport( V_INFO, "Using TPIU : true (ITM on channel %d)" EOL, options.tpiuITMChannel );
+        genericsReport( V_INFO, "Using TPIU : true (ITM on channel %d)" EOL, options.tpiuChannel );
     }
     else
     {
@@ -558,117 +530,60 @@ int _processOptions( int argc, char *argv[] )
 }
 // ====================================================================================================
 
-int fileFeeder( void )
-
+static struct Stream *_tryOpenStream()
 {
-    int f;
-    unsigned char cbw[TRANSFER_SIZE];
-    ssize_t t;
-
-    if ( ( f = open( options.file, O_RDONLY ) ) < 0 )
+    if ( options.file != NULL )
     {
-        genericsExit( -4, "Can't open file %s" EOL, options.file );
+        return streamCreateFile( options.file );
     }
-
-    while ( ( t = read( f, cbw, TRANSFER_SIZE ) ) >= 0 )
+    else
     {
+        return streamCreateSocket( options.server, options.port );
+    }
+}
+// ====================================================================================================
+static void _feedStream( struct Stream *stream )
+{
+    unsigned char cbw[TRANSFER_SIZE];
 
-        if ( !t )
+    while ( true )
+    {
+        size_t receivedSize;
+        enum ReceiveResult result = stream->receive( stream, cbw, TRANSFER_SIZE, NULL, &receivedSize );
+
+        if ( result != RECEIVE_RESULT_OK )
         {
-            if ( options.endTerminate )
+            if ( result == RECEIVE_RESULT_EOF && options.endTerminate )
+            {
+                return;
+            }
+            else if ( result == RECEIVE_RESULT_ERROR )
             {
                 break;
             }
             else
             {
-                // Just spin for a while to avoid clogging the CPU
                 usleep( 100000 );
-                continue;
             }
         }
 
         unsigned char *c = cbw;
 
-        while ( t-- )
-        {
-            _protocolPump( *c++ );
-        }
-    }
-
-    if ( !options.endTerminate )
-    {
-        genericsReport( V_INFO, "File read error" EOL );
-    }
-
-    close( f );
-    return true;
-}
-
-// ====================================================================================================
-int socketFeeder( void )
-
-{
-    int sockfd;
-    struct sockaddr_in serv_addr;
-    struct hostent *server;
-    unsigned char cbw[TRANSFER_SIZE];
-    ssize_t t;
-    int flag = 1;
-
-    sockfd = socket( AF_INET, SOCK_STREAM, 0 );
-    setsockopt( sockfd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof( flag ) );
-
-    if ( sockfd < 0 )
-    {
-        genericsReport( V_ERROR, "Error creating socket" EOL );
-        return -1;
-    }
-
-    /* Now open the network connection */
-    bzero( ( char * ) &serv_addr, sizeof( serv_addr ) );
-    server = gethostbyname( options.server );
-
-    if ( !server )
-    {
-        genericsReport( V_ERROR, "Cannot find host" EOL );
-        return -1;
-    }
-
-    serv_addr.sin_family = AF_INET;
-    bcopy( ( char * )server->h_addr,
-           ( char * )&serv_addr.sin_addr.s_addr,
-           server->h_length );
-    serv_addr.sin_port = htons( options.port );
-
-    if ( connect( sockfd, ( struct sockaddr * ) &serv_addr, sizeof( serv_addr ) ) < 0 )
-    {
-        genericsReport( V_ERROR, "Could not connect" EOL );
-        return -1;
-    }
-
-    while ( ( t = read( sockfd, cbw, TRANSFER_SIZE ) ) > 0 )
-    {
-        unsigned char *c = cbw;
-
-        while ( t-- )
+        while ( receivedSize-- )
         {
             _protocolPump( *c++ );
         }
 
         fflush( stdout );
     }
-
-    genericsReport( V_ERROR, "Read failed" EOL );
-
-    close( sockfd );
-    return -2;
-
 }
 
 // ====================================================================================================
 int main( int argc, char *argv[] )
 
 {
+    bool alreadyReported = false;
+
     if ( !_processOptions( argc, argv ) )
     {
         exit( -1 );
@@ -678,17 +593,52 @@ int main( int argc, char *argv[] )
     TPIUDecoderInit( &_r.t );
     ITMDecoderInit( &_r.i, options.forceITMSync );
 
-    if ( options.file )
+    while ( true )
     {
-        exit( fileFeeder() );
-    }
+        struct Stream *stream = NULL;
 
-    do {
-	    int rc = socketFeeder();
-	    // TODO - make logging of failures/reconnections "nicer" based on rc?
-	    (void)rc;
-	    // tradeoff to re-attach "promptly" vs CPU spinning and log spam
-	    usleep(100*1000);
-    } while (!options.endTerminate);
+        while ( true )
+        {
+            stream = _tryOpenStream();
+
+            if ( stream != NULL )
+            {
+                if ( alreadyReported )
+                {
+                    genericsReport( V_INFO, "Connected" EOL );
+                    alreadyReported = false;
+                }
+
+                break;
+            }
+
+            if ( !alreadyReported )
+            {
+                genericsReport( V_INFO, EOL "No connection" EOL );
+                alreadyReported = true;
+            }
+
+            if ( options.endTerminate )
+            {
+                break;
+            }
+
+            /* Checking every 100ms for a connection is quite often enough */
+            usleep( 10000 );
+        }
+
+        if ( stream != NULL )
+        {
+            _feedStream( stream );
+        }
+
+        stream->close( stream );
+        free( stream );
+
+        if ( options.endTerminate )
+        {
+            break;
+        }
+    }
 }
 // ====================================================================================================

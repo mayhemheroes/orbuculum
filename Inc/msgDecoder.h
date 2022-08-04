@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
 
 #ifndef _MSG_DECODER_
 #define _MSG_DECODER_
@@ -5,6 +6,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#include <stdint.h>
+#include <stdbool.h>
 
 /* Do not change the order of existing message types! */
 enum MSGType

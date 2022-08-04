@@ -1,0 +1,33 @@
+name: Build Windows binaries
+
+on:
+  - push
+  - pull_request
+
+jobs:
+  win64:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          msystem: MINGW64
+          install: >-
+            base-devel
+            mingw-w64-x86_64-libusb
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-zeromq
+            git
+            zip
+      - uses: actions/checkout@v2
+      - run: make build
+      - run: make install install-mingw-deps DESTDIR=ofiles/dist_win INSTALL_ROOT=/
+      - uses: actions/upload-artifact@v3
+        with:
+          name: orbuculum-win64
+          path: ofiles/dist_win/**/*.*
+          if-no-files-found: error
+

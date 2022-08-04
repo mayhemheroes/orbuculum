@@ -1,45 +1,23 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 /*
  * Generic Routines
  * ================
  *
- * Copyright (C) 2017, 2019  Dave Marples  <dave@marples.net>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- * * Redistributions of source code must retain the above copyright
- *   notice, this list of conditions and the following disclaimer.
- * * Redistributions in binary form must reproduce the above copyright
- *   notice, this list of conditions and the following disclaimer in the
- *   documentation and/or other materials provided with the distribution.
- * * Neither the names Orbtrace, Orbuculum nor the names of its
- *   contributors may be used to endorse or promote products derived from
- *   this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
- * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
  */
 
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <limits.h>
+#include <string.h>
 #include <sys/time.h>
+
 #include "generics.h"
 
 #define MAX_STRLEN (4096) // Maximum length of debug string
+#if defined(WIN32)
+    #define _POSIX_ARG_MAX 4096
+#endif
 
 // ====================================================================================================
 char *genericsEscape( char *str )
@@ -182,6 +160,12 @@ void genericsSetReportLevel( enum verbLevel lset )
     lstore = lset;
 }
 // ====================================================================================================
+enum verbLevel genericsGetReportLevel( void )
+
+{
+    return lstore;
+}
+// ====================================================================================================
 uint64_t genericsTimestampuS( void )
 
 {
@@ -210,6 +194,42 @@ void genericsPrintf( const char *fmt, ... )
     vsnprintf( op, MAX_STRLEN, fmt, va );
     va_end( va );
     fputs( op, stdout );
+    fflush( stdout );
+}
+// ====================================================================================================
+const char *genericsBasename( const char *n )
+
+/* Find basename of given path...returns empty string if path ends with / */
+
+{
+    const char *p = n + strlen( n );
+
+    while ( ( p != n ) && ( *( p - 1 ) != '/' ) )
+    {
+        p--;
+    }
+
+    return p;
+}
+// ====================================================================================================
+const char *genericsBasenameN( const char *n, int c )
+
+/* Find basename + c path elements of given path...returns path if path ends with / */
+
+{
+    const char *p = n + strlen( n );
+
+    while ( ( p != n ) && ( c ) && ( *( p - 1 ) != '/' ) )
+    {
+        p--;
+
+        if ( *p == '/' )
+        {
+            c--;
+        }
+    }
+
+    return p;
 }
 // ====================================================================================================
 void genericsReport( enum verbLevel l, const char *fmt, ... )
@@ -218,7 +238,7 @@ void genericsReport( enum verbLevel l, const char *fmt, ... )
 
 {
     static char op[MAX_STRLEN];
-    static char *colours[V_MAX_VERBLEVEL] = {C_LRED, C_YELLOW, C_LCYAN, C_LGREEN};
+    static char *colours[V_MAX_VERBLEVEL] = {C_VERB_ERROR, C_VERB_WARN, C_VERB_INFO, C_VERB_DEBUG};
 
     if ( l <= lstore )
     {
@@ -229,6 +249,8 @@ void genericsReport( enum verbLevel l, const char *fmt, ... )
         va_end( va );
         fputs( op, stderr );
         fputs( C_RESET, stderr );
+        fflush( stderr );
+        fflush( stdout );
     }
 }
 // ====================================================================================================
@@ -241,7 +263,11 @@ void genericsExit( int status, const char *fmt, ... )
     va_start( va, fmt );
     vsnprintf( op, MAX_STRLEN, fmt, va );
     va_end( va );
+    fputs( C_VERB_ERROR, stderr );
     fputs( op, stderr );
+    fputs( C_RESET, stderr );
+    fflush( stderr );
+    fflush( stdout );
 
     exit( status );
 }

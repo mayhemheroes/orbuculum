@@ -1,73 +1,26 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 /*
- * SWO Dumper for Blackmagic Probe and TTL Serial Interfaces
- * =========================================================
+ * ITM Dumper for Orbuculum
+ * ========================
  *
- * Copyright (C) 2017, 2019  Dave Marples  <dave@marples.net>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- * * Redistributions of source code must retain the above copyright
- *   notice, this list of conditions and the following disclaimer.
- * * Redistributions in binary form must reproduce the above copyright
- *   notice, this list of conditions and the following disclaimer in the
- *   documentation and/or other materials provided with the distribution.
- * * Neither the names Orbtrace, Orbuculum nor the names of its
- *   contributors may be used to endorse or promote products derived from
- *   this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
- * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
  */
 
-#include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <ctype.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
 #include <stdio.h>
-#include <string.h>
-#if defined OSX
-    #include "osxelf.h"
-    #include <libusb.h>
-#else
-    #include <elf.h>
-    #if defined LINUX
-        #include <libusb-1.0/libusb.h>
-    #else
-        #error "Unknown OS"
-    #endif
-#endif
-#include <stdint.h>
-#include <limits.h>
-#include <termios.h>
-#include <pthread.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
+#include <getopt.h>
+
 #include "generics.h"
 #include "uthash.h"
 #include "git_version_info.h"
 #include "generics.h"
 #include "tpiuDecoder.h"
 #include "itmDecoder.h"
+#include "stream.h"
 
-#define SERVER_PORT 3443                     /* Server port definition */
-#define TRANSFER_SIZE (4096)                 /* Maximum packet we might receive */
+#include "nw.h"
+
 #define MAX_STRING_LENGTH (256)              /* Maximum length that will be output from a fifo for a single event */
 
 #define DEFAULT_OUTFILE "/dev/stdout"
@@ -85,7 +38,7 @@ struct                                      /* Record for options, either defaul
     /* File to output dump to */
     char *outfile;
 
-    /* Do we need to write syncronously */
+    /* Do we need to write synchronously */
     bool writeSync;
 
     /* How long to dump */
@@ -101,7 +54,7 @@ struct                                      /* Record for options, either defaul
     .tpiuITMChannel = 1,
     .outfile = DEFAULT_OUTFILE,
     .timelen = DEFAULT_TIMELEN,
-    .port = SERVER_PORT,
+    .port = NWCLIENT_SERVER_PORT,
     .server = "localhost"
 };
 
@@ -179,7 +132,7 @@ void _protocolPump( uint8_t c )
 
                     if ( _r.p.packet[g].s != 0 )
                     {
-                        genericsReport( V_WARN, "Unknown TPIU channel %02x" EOL, _r.p.packet[g].s );
+                        genericsReport( V_DEBUG, "Unknown TPIU channel %02x" EOL, _r.p.packet[g].s );
                     }
                 }
 
@@ -199,28 +152,49 @@ void _protocolPump( uint8_t c )
     }
 }
 // ====================================================================================================
-void _printHelp( char *progName )
+void _printHelp( const char *const progName )
 
 {
-    fprintf( stdout, "Usage: %s <htv> <-i channel> <-p port> <-s server>" EOL, progName );
-    fprintf( stdout, "        h: This help" EOL );
-    fprintf( stdout, "        i: <channel> Set ITM Channel in TPIU decode (defaults to 1)" EOL );
-    fprintf( stdout, "        l: <timelen> Length of time in ms to record from point of acheiving sync (defaults to %dmS)" EOL, options.timelen );
-    fprintf( stdout, "        n: Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)" EOL );
-    fprintf( stdout, "        o: <filename> to be used for dump file (defaults to %s)" EOL, options.outfile );
-    fprintf( stdout, "        p: <Port> to use" EOL );
-    fprintf( stdout, "        s: <Server> to use" EOL );
-    fprintf( stdout, "        t: Use TPIU decoder" EOL );
-    fprintf( stdout, "        v: <level> Verbose mode 0(errors)..3(debug)" EOL );
-    fprintf( stdout, "        w: Write syncronously to the output file after every packet" EOL );
+    genericsPrintf( "Usage: %s [options]" EOL, progName );
+    genericsPrintf( "    -h, --help:         This help" EOL );
+    genericsPrintf( "    -l, --length:       <timelen> Length of time in ms to record from point of acheiving sync (defaults to %dmS)" EOL, options.timelen );
+    genericsPrintf( "    -n, --itm-sync:     Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)" EOL );
+    genericsPrintf( "    -o, --output-file:  <filename> to be used for dump file (defaults to %s)" EOL, options.outfile );
+    genericsPrintf( "    -p, --port:         <Port> to use" EOL );
+    genericsPrintf( "    -s, --server:       <Server> to use" EOL );
+    genericsPrintf( "    -t, --tpiu:         <channel> Use TPIU decoder on specified channel, normally 1" EOL );
+    genericsPrintf( "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
+    genericsPrintf( "    -V, --version:      Print version and exit" EOL );
+    genericsPrintf( "    -w, --sync-write:   Write synchronously to the output file after every packet" EOL );
 }
 // ====================================================================================================
-int _processOptions( int argc, char *argv[] )
+void _printVersion( void )
 
 {
-    int c;
+    genericsPrintf( "orbdump version " GIT_DESCRIBE EOL );
+}
+// ====================================================================================================
+static struct option _longOptions[] =
+{
+    {"help", no_argument, NULL, 'h'},
+    {"length", required_argument, NULL, 'l'},
+    {"itm-sync", no_argument, NULL, 'n'},
+    {"output-file", required_argument, NULL, 'o'},
+    {"port", required_argument, NULL, 'p'},
+    {"server", required_argument, NULL, 's'},
+    {"tpiu", required_argument, NULL, 't'},
+    {"verbose", required_argument, NULL, 'v'},
+    {"version", no_argument, NULL, 'V'},
+    {"sync-write", no_argument, NULL, 'w'},
+    {NULL, no_argument, NULL, 0}
+};
+// ====================================================================================================
+bool _processOptions( int argc, char *argv[] )
 
-    while ( ( c = getopt ( argc, argv, "hti:l:no:p:s:vw" ) ) != -1 )
+{
+    int c, optionIndex = 0;
+
+    while ( ( c = getopt_long ( argc, argv, "hVl:no:p:s:t:v:w", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             case 'o':
@@ -245,9 +219,6 @@ int _processOptions( int argc, char *argv[] )
 
             case 't':
                 options.useTPIU = true;
-                break;
-
-            case 'i':
                 options.tpiuITMChannel = atoi( optarg );
                 break;
 
@@ -262,6 +233,11 @@ int _processOptions( int argc, char *argv[] )
 
             case 'h':
                 _printHelp( argv[0] );
+                return false;
+
+            // ------------------------------------
+            case 'V':
+                _printVersion();
                 return false;
 
             case '?':
@@ -287,8 +263,7 @@ int _processOptions( int argc, char *argv[] )
         return false;
     }
 
-    genericsReport( V_INFO, "orbdump V" VERSION " (Git %08X %s, Built " BUILD_DATE ")" EOL, GIT_HASH, ( GIT_DIRTY ? "Dirty" : "Clean" ) );
-
+    genericsReport( V_INFO, "orbdump version " GIT_DESCRIBE EOL );
     genericsReport( V_INFO, "Server    : %s:%d" EOL, options.server, options.port );
     genericsReport( V_INFO, "ForceSync : %s" EOL, options.forceITMSync ? "true" : "false" );
 
@@ -310,20 +285,22 @@ int _processOptions( int argc, char *argv[] )
 
     return true;
 }
+
+static struct Stream *_tryOpenStream()
+{
+    return streamCreateSocket( options.server, options.port );
+}
+
 // ====================================================================================================
 int main( int argc, char *argv[] )
-
 {
-    int sockfd;
-    struct sockaddr_in serv_addr;
-    struct hostent *server;
     uint8_t cbw[TRANSFER_SIZE];
     uint64_t firstTime = 0;
     size_t octetsRxed = 0;
     FILE *opFile;
 
-    ssize_t readLength, t;
-    int flag = 1;
+    ssize_t t;
+    size_t receivedSize;
 
     bool haveSynced = false;
 
@@ -336,33 +313,9 @@ int main( int argc, char *argv[] )
     TPIUDecoderInit( &_r.t );
     ITMDecoderInit( &_r.i, options.forceITMSync );
 
-    sockfd = socket( AF_INET, SOCK_STREAM, 0 );
-    setsockopt( sockfd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof( flag ) );
+    struct Stream *stream = _tryOpenStream();
 
-    if ( sockfd < 0 )
-    {
-        genericsReport( V_ERROR, "Error creating socket" EOL );
-        return -1;
-    }
-
-
-    /* Now open the network connection */
-    bzero( ( char * ) &serv_addr, sizeof( serv_addr ) );
-    server = gethostbyname( options.server );
-
-    if ( !server )
-    {
-        genericsReport( V_ERROR, "Cannot find host" EOL );
-        return -1;
-    }
-
-    serv_addr.sin_family = AF_INET;
-    bcopy( ( char * )server->h_addr,
-           ( char * )&serv_addr.sin_addr.s_addr,
-           server->h_length );
-    serv_addr.sin_port = htons( options.port );
-
-    if ( connect( sockfd, ( struct sockaddr * ) &serv_addr, sizeof( serv_addr ) ) < 0 )
+    if ( stream == NULL )
     {
         genericsReport( V_ERROR, "Could not connect" EOL );
         return -1;
@@ -380,8 +333,24 @@ int main( int argc, char *argv[] )
     genericsReport( V_INFO, "Waiting for sync" EOL );
 
     /* Start the process of collecting the data */
-    while ( ( readLength = read( sockfd, cbw, TRANSFER_SIZE ) ) > 0 )
+    while ( true )
     {
+        enum ReceiveResult result = stream->receive( stream, cbw, TRANSFER_SIZE, NULL, &receivedSize );
+
+        if ( result != RECEIVE_RESULT_OK )
+        {
+            if ( result == RECEIVE_RESULT_EOF )
+            {
+                break;
+            }
+
+            if ( result == RECEIVE_RESULT_ERROR )
+            {
+                genericsReport( V_ERROR, "Reading from connection failed" EOL );
+                return -2;
+            }
+        }
+
         if ( ( options.timelen ) && ( ( firstTime != 0 ) && ( ( _timestamp() - firstTime ) > options.timelen ) ) )
         {
             /* This packet arrived at the end of the window...finish the write process */
@@ -390,7 +359,7 @@ int main( int argc, char *argv[] )
 
         uint8_t *c = cbw;
 
-        t = readLength;
+        t = receivedSize;
 
         while ( t-- )
         {
@@ -419,7 +388,7 @@ int main( int argc, char *argv[] )
             genericsReport( V_INFO, "Started recording" EOL );
         }
 
-        octetsRxed += fwrite( cbw, 1, readLength, opFile );
+        octetsRxed += fwrite( cbw, 1, receivedSize, opFile );
 
         if ( !ITMDecoderIsSynced( &_r.i ) )
         {
@@ -428,14 +397,19 @@ int main( int argc, char *argv[] )
 
         if ( options.writeSync )
         {
+#if defined(WIN32)
+            _flushall();
+#else
             sync();
+#endif
         }
     }
 
-    close( sockfd );
+    stream->close( stream );
+    free( stream );
     fclose( opFile );
 
-    if ( readLength <= 0 )
+    if ( receivedSize <= 0 )
     {
         genericsReport( V_ERROR, "Network Read failed" EOL );
         return -2;

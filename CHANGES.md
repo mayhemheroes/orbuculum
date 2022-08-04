@@ -1,3 +1,33 @@
+Version 2.0.0 in Progress
+
+* Addition of orbzmq for ZeroMQ support
+* Significant simplifications to the orbuculum mux to reduce load/improve throughput
+* New longopts & some name changes to options
+* makefile install and uninstall capability
+* orbtrace utility now supports SWO
+* Fix packet scheduling from orbuculum
+* Move to semantic numbering - 2.00 becomes 2.0.0. 
+* Various fixes in orbmortem for reliability and performance
+* Improve timing of orbuculum mux to ensure data get flushed to orbmortem on crash
+* Version bumped to 2.00 in Progress because of size and impact of changes
+* Addition of `orbprofile` for ETM profiling and integration with {k/q}cachegrind, see https://github.com/KDE/kcachegrind.
+* Addition of `orbmortem` for ETM/ETB post-mortem analysis.
+* Licenses updated to use SPDX identifiers...the license itself hasn't changed, we just lost a chunk of text at the head of every file, with the license now in the LICENSE file.
+* Orbtrace split off into separate repository
+* Split of orbuculum into the network server (orbuculum) and the fifo server (orbfifo).
+* Extensive changes to support orbtrace
+
+3rd June 2022 (Version 1.13)
+
+* Fix -v missing parameter
+* Allow orbcat sockets to reconnect on loss of connection
+* Add SAM5X SWO support
+* Prevent segfault in orbtop when elf changes
+* Fix assert when fpga has no data to deliver
+* Add pyocd to list of trace sources
+*Complete fix for specified length integers on 32 bit platforms (Rasbian support)
+* Compatability with languages other than C family (specifically Rust)
+
 23rd October 2020 (Version 1.10)
 
 * Replace `master` with `main`.
@@ -20,7 +50,7 @@
 * Change to BSD from GPL License
 * Fixes to command line options, raw output and HW event decoding
 * Use of nextpnr-ice40 instead of arachne-pnr
-* Extensive changes to gdbtrace.init 
+* Extensive changes to gdbtrace.init
 
 14th August 2019 (Version 0.23)
 
@@ -44,4 +74,3 @@
 * Addition of C++ demangling support.
 * Specific gdbinit support for STM32F4
 * Small changes to support libftdi1.4 exclusively. It's essential you use this version of libftdi or higher!
-

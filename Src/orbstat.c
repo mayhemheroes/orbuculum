@@ -1,178 +1,134 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 /*
- * Stats interface for Blackmagic Probe and TTL Serial Interfaces
- * ==============================================================
+ * ITM Profiling module for Orbuculum
+ * ==================================
  *
- * Copyright (C) 2017, 2019  Dave Marples  <dave@marples.net>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- * * Redistributions of source code must retain the above copyright
- *   notice, this list of conditions and the following disclaimer.
- * * Redistributions in binary form must reproduce the above copyright
- *   notice, this list of conditions and the following disclaimer in the
- *   documentation and/or other materials provided with the distribution.
- * * Neither the names Orbtrace, Orbuculum nor the names of its
- *   contributors may be used to endorse or promote products derived from
- *   this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
- * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
  */
 
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <ctype.h>
-#include <sys/socket.h>
 #include <sys/types.h>
-#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <stdio.h>
-#include <string.h>
-#include <stdarg.h>
-#include "bfd_wrapper.h"
-#if defined OSX
-    #include "osxelf.h"
-    #include <libusb.h>
-#else
-    #include <elf.h>
-    #if defined LINUX
-        #include <libusb-1.0/libusb.h>
-    #else
-        #error "Unknown OS"
-    #endif
-#endif
-#include <stdint.h>
-#include <limits.h>
-#include <termios.h>
-#include <pthread.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
+#include <signal.h>
 #include <assert.h>
-#include <netdb.h>
-#include <inttypes.h>
+#include <getopt.h>
 
 #include "git_version_info.h"
 #include "uthash.h"
 #include "generics.h"
-#include "tpiuDecoder.h"
 #include "itmDecoder.h"
-#include "symbols.h"
+#include "tpiuDecoder.h"
 #include "msgDecoder.h"
+#include "symbols.h"
+#include "nw.h"
+#include "ext_fileformats.h"
+#include "stream.h"
 
-#define TEXT_SEGMENT ".text"
-#define DEFAULT_TRACE_CHANNEL  30            /* Channel that we expect trace data to arrive on */
-#define DEFAULT_FILE_CHANNEL   29            /* Channel that we expect file data to arrive on */
+#define TICK_TIME_MS        (1)          /* Time intervals for checks */
+#define DEFAULT_DURATION_MS (1000)       /* Default time to sample, in mS */
 
-#define SERVER_PORT 3443                     /* Server port definition */
-#define TRANSFER_SIZE (4096)                 /* Maximum packet we might receive */
-#define TOP_UPDATE_INTERVAL (1000LL)         /* Interval between each on screen update */
+#define DEFAULT_TRACE_CHANNEL  30        /* ITM Channel that we expect trace data to arrive on */
+#define DEFAULT_FILE_CHANNEL   29        /* ITM Channel that we expect file data to arrive on */
 
 /* Interface to/from target */
 #define COMMS_MASK (0xF0000000)
 #define IN_EVENT   (0x40000000)
 #define OUT_EVENT  (0x50000000)
 
-/* An entry in the names table */
-struct nameEntryHash
-{
-    struct nameEntry *n;
-    bool seen;
-    uint32_t index;
-    UT_hash_handle hh;
-};
-
-/* A calling edge */
-struct edge
-{
-    uint32_t src;
-    uint32_t dst;
-    uint64_t tstamp;
-    bool in;
-};
-
-/* Processed subcalls from routine to routine */
-struct subcalls
-{
-    uint32_t src;
-    uint32_t dst;
-    uint64_t myCost;
-    uint64_t total;
-};
-
 /* States for sample reception state machine */
 enum CDState { CD_waitinout, CD_waitsrc, CD_waitdst };
 
 /* ---------- CONFIGURATION ----------------- */
-struct                                       /* Record for options, either defaults or from command line */
+struct Options                           /* Record for options, either defaults or from command line */
 {
-    bool useTPIU;                            /* Are we decoding via the TPIU? */
-    uint32_t tpiuITMChannel;                 /* What channel? */
-    bool forceITMSync;                       /* Do we assume ITM starts synced? */
+    bool demangle;                       /* Demangle C++ names */
+    char *file;                          /* File host connection */
+    bool fileTerminate;                  /* Terminate when file read isn't successful */
 
-    char *deleteMaterial;                    /* Material to strip off front of filenames for target */
+    char *deleteMaterial;                /* Material to strip off front of filenames for target */
+    bool truncateDeleteMaterial;         /* Do we want this material totally removing from file references? */
 
-    char *elffile;                           /* Target program config */
+    char *elffile;                       /* Target program config */
+    char *odoptions;                     /* Options to pass directly to objdump */
 
-    char *dotfile;                           /* File to output dot information */
-    char *profile;                           /* File to output profile information */
+    int traceChannel;                    /* ITM Channel used for trace */
+    int fileChannel;                     /* ITM Channel used for file output */
 
-    int traceChannel;                        /* ITM Channel used for trace */
-    int fileChannel;                         /* ITM Channel used for file output */
-    int port;                                /* Source information for where to connect to */
+    char *dotfile;                       /* File to output dot information */
+    char *profile;                       /* File to output profile information */
+    uint32_t sampleDuration;             /* How long we are going to sample for */
+    bool forceITMSync;                   /* Do we assume ITM starts synced? */
+
+    bool useTPIU;                        /* Are we using TPIU, and stripping TPIU frames? */
+    uint32_t tpiuITMChannel;             /* Which TPIU channel to use for ITM */
+
+    int port;                            /* Source information for where to connect to */
     char *server;
 
-} options =
+} _options =
 {
-    .forceITMSync = true,
-    .tpiuITMChannel = 1,
-    .port = SERVER_PORT,
-    .server = "localhost",
-    .traceChannel = DEFAULT_TRACE_CHANNEL,
-    .fileChannel = DEFAULT_FILE_CHANNEL
+    .demangle       = true,
+    .sampleDuration = DEFAULT_DURATION_MS,
+    .port           = NWCLIENT_SERVER_PORT,
+    .traceChannel   = DEFAULT_TRACE_CHANNEL,
+    .fileChannel    = DEFAULT_FILE_CHANNEL,
+    .forceITMSync   = true,
+    .server         = "localhost"
+};
+
+/* A block of received data */
+struct dataBlock
+{
+    ssize_t fillLevel;
+    uint8_t buffer[TRANSFER_SIZE];
 };
 
 /* ----------- LIVE STATE ----------------- */
-struct
+struct RunTime
 {
-    struct ITMDecoder i;                    /* The decoders and the packets from them */
+    struct ITMDecoder i;                /* The decoders and the packets from them */
     struct ITMPacket h;
     struct TPIUDecoder t;
     struct TPIUPacket p;
+    struct msg m;                       /* Decoded message out of ITM layer */
+
+    const char *progName;               /* Name by which this program was called */
+    bool      ending;                   /* Flag indicating app is terminating */
+    uint64_t intervalBytes;             /* Number of bytes transferred in current interval */
 
     /* Calls related info */
-    enum CDState CDState;                   /* State of the call data machine */
-    struct edge callsConstruct;             /* Call data entry under construction */
-    struct edge *calls;                     /* Call data table */
-    struct subcalls *sub;                   /* Construct data */
+    enum CDState CDState;               /* State of the call data machine */
+    struct edge *calls;                 /* Call data table */
 
-    uint32_t subPsn;                        /* Counter for sub calls */
-    uint32_t psn;                           /* Current position in assessment of data */
-    uint32_t cdCount;                       /* Call data count */
+    struct subcall *subhead;            /* Calls onstruct data */
+    struct subcall **substack;          /* Calls stack data */
+    uint32_t substacklen;               /* Calls stack length */
 
-    struct SymbolSet *s;                    /* Symbols read from elf */
-    FILE *c;                                /* Writable file */
+    struct execEntryHash *insthead;     /* Exec table handle for hash */
+
+    struct SymbolSet *s;                /* Symbols read from elf */
+    struct Options *options;            /* Our runtime configuration */
+
+    struct dataBlock rawBlock;          /* Datablock received from distribution */
+
+    bool sampling;                      /* Are we actively sampling at the moment */
+    uint32_t starttime;                 /* At what time did we start sampling? */
 
     /* Turn addresses into files and routines tags */
-    uint32_t nameCount;
-    struct nameEntryHash *name;
+    struct execEntryHash *from;         /* Where the call was from */
+    struct execEntryHash *to;           /* Where the call was to */
 
     /* Used for stretching number of bits in target timer */
-    uint32_t oldt;
-    uint64_t highOrdert;
-} _r;
+    uint32_t oldt;                      /* Last received timestamp */
+    uint64_t highOrdert;                /* High order bits */
+    uint64_t tcount;                    /* Constructed current count */
+    uint64_t starttcount;               /* Count at which we started */
+} _r =
+{
+    .options = &_options
+};
 
 // ====================================================================================================
 // ====================================================================================================
@@ -184,490 +140,204 @@ struct
 
 
 // ====================================================================================================
+// Callback function for trace messages from the target CPU (via ITM channel)
 // ====================================================================================================
-// ====================================================================================================
-// Handler for individual message types from SWO
-// ====================================================================================================
-// ====================================================================================================
-// ====================================================================================================
-void _handleSW( struct swMsg *m, struct ITMDecoder *i )
+static void _handleSW( struct RunTime *r )
 
 {
-    assert( m->msgtype == MSG_SOFTWARE );
+    struct nameEntry n;
+    struct subcallSig sig;
+    struct subcall *s;
+    static bool isIn;
+    uint32_t addr;
 
-    if ( m->srcAddr == options.traceChannel )
+    struct swMsg *m = ( struct swMsg * )&r->m;
+
+    if ( m->srcAddr == r->options->traceChannel )
     {
-        switch ( _r.CDState )
+        switch ( r->CDState )
         {
-            // --------------------
+            // -------------------- Reporting the time stamp and if it's an In or Out event
             case CD_waitinout:
                 if ( ( m->value & COMMS_MASK ) == IN_EVENT )
                 {
-                    _r.callsConstruct.in = true;
-                    _r.CDState = CD_waitsrc;
+                    isIn = true;
+                    r->CDState = CD_waitsrc;
                 }
 
                 if ( ( m->value & COMMS_MASK ) == OUT_EVENT )
                 {
-                    _r.callsConstruct.in = false;
-                    _r.CDState = CD_waitsrc;
+                    isIn = false;
+                    r->CDState = CD_waitsrc;
                 }
 
-                /* Time is encoded in lowest two octets ...accomodate rollover */
-                uint32_t t = m->value & 0xFFFF;
-
-                if ( t < _r.oldt )
+                if ( r->CDState != CD_waitinout )
                 {
-                    _r.highOrdert++;
+                    /* Time is encoded in lowest three octets ...accomodate rollover */
+                    uint32_t t = m->value & 0xFFFFFF;
+
+                    if ( t < _r.oldt )
+                    {
+                        r->highOrdert++;
+                    }
+
+                    r->oldt = t;
+                    r->tcount = ( _r.highOrdert << 24 ) | t;
+
+                    /* Finally, if we're not sampling, then start sampling */
+                    if ( !r->sampling )
+                    {
+                        genericsReport( V_WARN, "Sampling" EOL );
+                        /* Fill in a time to start from */
+                        r->starttime     = genericsTimestampmS();
+                        r->intervalBytes = 0;
+                        r->starttcount   = r->tcount;
+                        r->sampling      = true;
+                    }
                 }
 
-                _r.oldt = t;
-                _r.callsConstruct.tstamp = ( _r.highOrdert << 16 ) | t;
                 break;
 
-            // --------------------
+            // -------------------- Reporting the source address
             case CD_waitsrc:
                 /* Source address is the address of the _return_, so subtract 4 */
-                _r.callsConstruct.src = ( m->value - 4 );
-                _r.CDState = CD_waitdst;
+                addr = ( m->value - 4 );
+                r->CDState = CD_waitdst;
+                HASH_FIND_INT( r->insthead, &addr, r->from );
+
+                if ( !r->from )
+                {
+                    if ( SymbolLookup( r->s, addr, &n ) )
+                    {
+                        r->from = calloc( 1, sizeof( struct execEntryHash ) );
+
+                        if ( !r->from )
+                        {
+                            genericsExit( ENOMEM,  "Memory allocation failure at %s::%d", __FILE__, __LINE__ );
+                        }
+
+                        r->from->addr          = addr;
+                        r->from->fileindex     = n.fileindex;
+                        r->from->line          = n.line;
+                        r->from->functionindex = n.functionindex;
+                    }
+                    else
+                    {
+                        genericsReport( V_ERROR, "No symbol for address %08x" EOL, addr );
+                        r->CDState = CD_waitinout;
+                        return;
+                    }
+
+                    HASH_ADD_INT( r->insthead, addr, ( r->from ) );
+                }
+
+                r->from->count++;
                 break;
 
-            // --------------------
+            // -------------------- Reporting the return address
             case CD_waitdst:
-                _r.callsConstruct.dst = m->value;
-                _r.CDState = CD_waitinout;
+                addr = m->value;
+                r->CDState = CD_waitinout;
 
-                /* Now store this for later processing */
-                _r.calls = ( struct edge * )realloc( _r.calls, sizeof( struct edge ) * ( _r.cdCount + 1 ) );
-                memcpy( &_r.calls[_r.cdCount], &_r.callsConstruct, sizeof( struct edge ) );
-                _r.cdCount++;
+                HASH_FIND_INT( r->insthead, &addr, r->to );
+
+                if ( !r->to )
+                {
+                    if ( SymbolLookup( r->s, addr, &n ) )
+                    {
+                        r->to = calloc( 1, sizeof( struct execEntryHash ) );
+
+                        if ( !r->to )
+                        {
+                            genericsExit( ENOMEM,  "Memory allocation failure at %s::%d", __FILE__, __LINE__ );
+                        }
+
+                        r->to->addr          = addr;
+                        r->to->fileindex     = n.fileindex;
+                        r->to->line          = n.line;
+                        r->to->functionindex = n.functionindex;
+                    }
+                    else
+                    {
+                        genericsReport( V_ERROR, "No symbol for address %08x" EOL, addr );
+                        r->CDState = CD_waitinout;
+                        return;
+                    }
+
+                    HASH_ADD_INT( r->insthead, addr, ( r->to ) );
+                }
+
+                r->to->count++;
+
+                /* ----------------------------------------------------------------------------------------------------------*/
+                /* We have everything. Record calls between functions. These are flagged via isIn true/false for call/return */
+                /* ----------------------------------------------------------------------------------------------------------*/
+                if ( isIn )
+                {
+                    /* Now make calling record */
+                    sig.src = r->from->addr;
+                    sig.dst = r->to->addr;
+
+                    /* Find, or create, the call record */
+                    HASH_FIND( hh, r->subhead, &sig, sizeof( struct subcallSig ), s );
+
+                    if ( !s )
+                    {
+                        /* This entry doesn't exist...let's create it */
+                        s = ( struct subcall * )calloc( 1, sizeof( struct subcall ) );
+
+                        if ( !s )
+                        {
+                            genericsExit( ENOMEM,  "Memory allocation failure at %s::%d", __FILE__, __LINE__ );
+                        }
+
+                        memcpy( &s->sig, &sig, sizeof( struct subcallSig ) );
+                        s->srch = r->from;
+                        s->dsth = r->to;
+                        HASH_ADD( hh, r->subhead, sig, sizeof( struct subcallSig ), s );
+                    }
+
+
+                    /* Now handle calling/return stack */
+                    /* However we got here, we've got a subcall record, so initialise its starting ticks */
+                    s->inTicks = r->tcount;
+                    s->count++;
+
+                    /* ...and add it to the call stack */
+                    r->substack = ( struct subcall ** )realloc( r->substack, ( r->substacklen + 1 ) * sizeof( struct subcall * ) );
+                    r->substack[r->substacklen++] = s;
+                }
+                else
+                {
+                    /* We've come out */
+                    if ( r->substacklen )
+                    {
+                        /* We don't bother deallocating memory here cos it'll be done on the next isSubCall */
+                        s = r->substack[--r->substacklen];
+
+                        if ( ( s->sig.src != r->from->addr ) || ( s->sig.dst != r->to->addr ) )
+                        {
+                            genericsReport( V_WARN, "Address mismatch" EOL );
+                        }
+
+                        s->myCost = ( r->tcount - s->inTicks );
+                    }
+                }
+
                 break;
                 // --------------------
         }
     }
 }
+
 // ====================================================================================================
-void _lookup( struct nameEntryHash **h, uint32_t addr )
-
-/* Lookup function for address to line, and hence to function, and cache in case we need it later */
-
-{
-    struct nameEntry *np;
-
-    HASH_FIND_INT( _r.name, &addr, *h );
-
-    if ( !( *h ) )
-    {
-        struct nameEntry ne;
-
-        /* Find a matching name record if there is one */
-        SymbolLookup( _r.s, addr, &ne, options.deleteMaterial );
-
-        /* Was found, so create new hash entry for this */
-        np = ( struct nameEntry * )malloc( sizeof( struct nameEntry ) );
-        *h = ( struct nameEntryHash * )malloc( sizeof( struct nameEntryHash ) );
-        memcpy( np, &ne, sizeof( struct nameEntry ) );
-        ( *h )->n = np;
-        ( *h )->index = _r.nameCount++;
-        ( *h )->seen = false;
-
-        HASH_ADD_INT( _r.name, n->addr, *h );
-    }
-}
-// ====================================================================================================
-void _flushHash( void )
-
-{
-    struct nameEntryHash *a;
-    UT_hash_handle hh;
-
-    for ( a = _r.name; a != NULL; a = hh.next )
-    {
-        hh = a->hh;
-        free( a );
-    }
-
-    _r.name = NULL;
-}
-// ====================================================================================================
-uint64_t _timestamp( void )
-
-/* Return a timestamp */
-
-{
-    struct timeval te;
-    gettimeofday( &te, NULL ); // get current time
-    uint64_t milliseconds = te.tv_sec * 1000LL + te.tv_usec / 1000; // caculate milliseconds
-    return milliseconds;
-}
-// ====================================================================================================
-int _addresses_sort_fn( const void *a, const void *b )
-
-/* Sort addresses first by src, then by dst */
-
-{
-    int32_t c = ( ( ( struct subcalls * )a )->src ) - ( ( ( struct subcalls * )b )->src );
-
-    if ( c )
-    {
-        return c;
-    }
-
-    return ( ( ( struct subcalls * )a )->dst ) - ( ( ( struct subcalls * )b )->dst );
-}
-// ====================================================================================================
-int _addresses_sort_dest_fn( const void *a, const void *b )
-
-/* Sort addresses first by dst, then by src */
-
-{
-    int32_t c = ( ( ( struct subcalls * )a )->dst ) - ( ( ( struct subcalls * )b )->dst );
-
-    if ( c )
-    {
-        return c;
-    }
-
-    return ( ( ( struct subcalls * )a )->src ) - ( ( ( struct subcalls * )b )->src );
-}
-// ====================================================================================================
-void _dumpProfile( void )
-
-/* Dump profile to Valgrind (KCacheGrind compatible) file format */
-
-{
-    struct nameEntryHash *f, *t;
-
-    uint64_t myCost;
-    uint64_t totalCost;
-    uint32_t totalCalls;
-
-    /* Empty the 'seen' field of the name cache */
-    HASH_ITER( hh, _r.name, f, t )
-    {
-        f->seen = false;
-    }
-
-    /* Record any destination routine and the time it's taken */
-    qsort( _r.sub, _r.subPsn, sizeof( struct subcalls ), _addresses_sort_dest_fn );
-
-    for ( uint32_t i = 0; i < _r.subPsn - 1; i++ )
-    {
-        /* Collect total cost and sub costs for this dest routine */
-        myCost = _r.sub[i].myCost;
-
-        while ( ( i < _r.subPsn - 1 ) && ( _r.sub[i].dst == _r.sub[i + 1].dst ) )
-        {
-            myCost += _r.sub[i++].myCost;
-        }
-
-        _lookup( &t, _r.sub[i].dst );
-
-        if ( !t->seen )
-        {
-            /* Haven't seen it before, so announce it */
-            fprintf( _r.c, "fl=(%d) %s\nfn=(%d) %s\n0x%08x %d %" PRIu64 "\n", t->index, t->n->filename, t->index, t->n->function, t->n->addr, t->n->line, myCost );
-            t->seen = true;
-        }
-    }
-
-
-    /* OK, now proceed to report the calls */
-
-    fprintf( _r.c, "\n\n## ------------------- Calls Follow ------------------------\n" );
-
-    for ( uint32_t i = 0; i < _r.subPsn - 2; i++ )
-    {
-        myCost = _r.sub[i].myCost;
-        totalCost = _r.sub[i].total;
-        totalCalls = 1;
-
-        while ( ( i < _r.subPsn - 2 ) && ( _r.sub[i].dst == _r.sub[i + 1].dst ) && ( _r.sub[i].src == _r.sub[i + 1].src ) )
-        {
-            i++;
-            totalCost += _r.sub[i].total;
-            myCost += _r.sub[i].myCost;
-            totalCalls++;
-        }
-
-        _lookup( &t, _r.sub[i].dst );
-
-        if ( !t->seen )
-        {
-            /* This is a previously unseen dest, announce it */
-            fprintf( _r.c, "fl=(%d) %s\nfn=(%d) %s\n0x%08x %d %" PRIu64 "\n", t->index, t->n->filename, t->index, t->n->function, t->n->addr, t->n->line, myCost );
-            t->seen = true;
-        }
-
-        _lookup( &f, _r.sub[i].src );
-
-        if ( !f->seen )
-        {
-            /* Add this in, but cost of the caller is not visible here...we need to put 1 else no code is visible */
-            fprintf( _r.c, "fl=(%d) %s\nfn=(%d) %s\n0x%08x %d 1\n", f->index, f->n->filename, f->index, f->n->function, f->n->addr, f->n->line );
-            f->seen = true;
-        }
-        else
-        {
-            fprintf( _r.c, "fl=(%d)\nfn=(%d)\n", f->index, f->index );
-        }
-
-        /* Now publish the call destination. By definition is is known, so can be shortformed */
-        fprintf( _r.c, "cfi=(%d)\ncfn=(%d)\ncalls=%d 0x%08x %d\n", t->index, t->index, totalCalls, _r.sub[i].dst, t->n->line );
-        fprintf( _r.c, "0x%08x %d %" PRIu64 "\n", _r.sub[i].src, f->n->line, totalCost );
-    }
-}
-// ====================================================================================================
-uint64_t _traverse( uint32_t layer )
-
-/* Recursively traverse the calls tree, recording each subroutine call as we go along */
-
-{
-    uint32_t startPoint = _r.psn; /* Record where we came in on this iteration */
-    uint64_t childCost = 0;      /* ...and keep a record of any children visited */
-
-    /* If this is an out and we're already at the top level then it's to be ignored */
-    if ( ( layer == 0 ) && ( !_r.calls[_r.psn].in ) )
-    {
-        _r.psn++;
-        return 0;
-    }
-
-    _r.psn++; /* Move past my node... */
-
-    /* Two cases...either an in node, in which case there is more to be covered */
-    /* or an out node, in which case we're done and we can just record what we've got */
-
-    /* ...of course there might be a whole sequence if in calls if we call several routines from ours */
-    while ( _r.calls[_r.psn].in )
-    {
-        if ( _r.psn >= _r.cdCount - 2 )
-        {
-            return 0;
-        }
-
-        childCost += _traverse( layer + 1 );
-    }
-
-
-    /* This is my out node....they may have been others below, but this one matches my in node */
-    /* At this point startPoint is the in node, and r_psn is the exit node, so store this entry */
-
-    _r.sub = ( struct subcalls * )realloc( _r.sub, ( ++_r.subPsn ) * ( sizeof( struct subcalls ) ) );
-    _r.sub[_r.subPsn - 1].dst = _r.calls[_r.psn].dst;
-    _r.sub[_r.subPsn - 1].src = _r.calls[_r.psn].src;
-    _r.sub[_r.subPsn - 1].total = _r.calls[_r.psn].tstamp - _r.calls[startPoint].tstamp;
-    _r.sub[_r.subPsn - 1].myCost = _r.sub[_r.subPsn - 1].total - childCost;
-
-    _r.psn++;
-
-    /* ...and float to level above any cost we've got */
-    return _r.sub[_r.subPsn - 1].total;
-}
-// ====================================================================================================
-void _outputProfile( void )
-
-/* Output a KCacheGrind compatible profile */
-
-{
-    _r.c = fopen( options.profile, "w" );
-    fprintf( _r.c, "# callgrind format\n" );
-    fprintf( _r.c, "positions: line instr\nevent: Cyc : Processor Clock Cycles\nevents: Cyc\n" );
-    /* Samples are in time order, so we can determine the extent of time.... */
-    fprintf( _r.c, "summary: %" PRIu64 "\n", _r.calls[_r.cdCount - 1].tstamp - _r.calls[0].tstamp );
-    fprintf( _r.c, "ob=%s\n", options.elffile );
-
-    /* If we have a set of sub-calls from a previous run then delete them */
-    if ( _r.sub )
-    {
-        free( _r.sub );
-        _r.sub = NULL;
-    }
-
-    _r.subPsn = 0;
-
-    _r.psn = 0;
-
-    while ( _r.psn < _r.cdCount - 2 )
-    {
-        _traverse( 0 );
-    }
-
-    _dumpProfile();
-    fclose( _r.c );
-}
-// ====================================================================================================
-
-/* types and compare-functions for qsort in _outputDot() */
-
-struct callVector
-{
-    struct nameEntryHash *fromName;
-    struct nameEntryHash *toName;
-    uint32_t count;
-};
-
-static int _addr_sort_dst_fn( const void *a, const void *b )
-
-{
-    int32_t c = ( ( ( struct edge * )a )->dst ) - ( ( ( struct edge * )b )->dst );
-
-    if ( c )
-    {
-        return c;
-    }
-
-    return ( ( ( struct edge * )a )->src ) - ( ( ( struct edge * )b )->src );
-}
-
-static int _calls_sort_src_fn( const void *a, const void *b )
-
-{
-    int32_t c = ( ( ( struct callVector * )a )->fromName ) - ( ( ( struct callVector * )b )->fromName );
-
-    if ( c )
-    {
-        return c;
-    }
-
-    return ( ( ( struct callVector * )a )->toName ) - ( ( ( struct callVector * )b )->toName );
-}
-
-static int _calls_sort_dst_fn( const void *a, const void *b )
-
-{
-    int32_t c = ( ( ( struct callVector * )a )->toName ) - ( ( ( struct callVector * )b )->toName );
-
-    if ( c )
-    {
-        return c;
-    }
-
-    return ( ( ( struct callVector * )a )->fromName ) - ( ( ( struct callVector * )b )->fromName );
-}
-// ====================================================================================================
-void _outputDot( void )
-
-/* Output call graph to dot file */
-
-{
-    FILE *c;
-    struct nameEntryHash *f = NULL, *t = NULL;
-
-    struct callVector *call = NULL;
-    uint32_t callCount = 0;
-
-    if ( !options.dotfile )
-    {
-        return;
-    }
-
-    /* Sort according to addresses visited. */
-    qsort( _r.calls, _r.cdCount, sizeof( struct edge ), _addr_sort_dst_fn );
-
-    /* Put in all the names of functions. There may be multiple addresses that match to a function, so crush them up */
-    _lookup( &f, _r.calls[0].src );
-    _lookup( &t, _r.calls[0].dst );
-
-    for ( uint32_t i = 0; i < _r.cdCount; i++ )
-    {
-        call = ( struct callVector * )realloc( call, sizeof( struct callVector ) * ( callCount + 1 ) );
-        call[callCount].fromName = f;
-        call[callCount].toName = t;
-        call[callCount].count = 0;
-
-        do
-        {
-            call[callCount].count++;
-            _lookup( &f, _r.calls[i].src );
-            _lookup( &t, _r.calls[i].dst );
-            i++;
-        }
-        while ( ( !strcmp( call[callCount].fromName->n->function, f->n->function ) ) && ( !strcmp( call[callCount].toName->n->function, t->n->function ) ) && ( i < _r.cdCount ) );
-
-        callCount++;
-    }
-
-    c = fopen( options.dotfile, "w" );
-    fprintf( c, "digraph calls\n{\n  overlap=false; splines=true; size=\"7.75,10.25\"; orientation=portrait; sep=0.1; nodesep=0.1;\n" );
-
-    /* firstly write out the nodes in each subgraph - dest side clustered */
-    qsort( call, callCount, sizeof( struct callVector ), _calls_sort_dst_fn );
-
-    for ( uint32_t x = 1; x < callCount; x++ )
-    {
-        fprintf( c, "  subgraph \"cluster_%s\"\n  {\n    label=\"%s\";\n    bgcolor=lightgrey;\n", call[x - 1].toName->n->filename, call[x - 1].toName->n->filename );
-
-        while ( x < callCount )
-        {
-            /* Now output each function in the subgraph */
-            fprintf( c, "    %s [style=filled, fillcolor=white];\n", call[x - 1].toName->n->function );
-
-            /* Spin forwards until the function name _or_ filename changes */
-            while ( ( x < callCount ) && ( call[x - 1].toName == call[x].toName ) )
-            {
-                x++;
-            }
-
-            if ( ( x >= callCount ) || ( strcmp( call[x - 1].toName->n->filename, call[x].toName->n->filename ) ) )
-            {
-                break;
-            }
-
-            x++;
-        }
-
-        fprintf( c, "  }\n\n" );
-    }
-
-    /* now write out the nodes in each subgraph - source side clustered */
-    qsort( call, callCount, sizeof( struct callVector ), _calls_sort_src_fn );
-
-    for ( uint32_t x = 1; x < callCount; x++ )
-    {
-        fprintf( c, "  subgraph \"cluster_%s\"\n  {\n    label=\"%s\";\n    bgcolor=lightgrey;\n", call[x - 1].fromName->n->filename, call[x - 1].fromName->n->filename );
-
-        while ( x < callCount )
-        {
-            /* Now output each function in the subgraph */
-            fprintf( c, "    %s [style=filled, fillcolor=white];\n", call[x - 1].fromName->n->function );
-
-            /* Spin forwards until the function name _or_ filename changes */
-            while ( ( x < callCount ) && ( call[x - 1].fromName == call[x].fromName ) )
-            {
-                x++;
-            }
-
-            if ( ( x >= callCount ) || ( strcmp( call[x - 1].fromName->n->filename, call[x].fromName->n->filename ) ) )
-            {
-                break;
-            }
-
-            x++;
-        }
-
-        fprintf( c, "  }\n\n" );
-    }
-
-    /* Now go through and label the arrows... */
-    for ( uint32_t x = 0; x < callCount; x++ )
-    {
-        fprintf( c, "    %s -> ", call[x].fromName->n->function );
-        fprintf( c, "%s [label=%d , weight=0.1;];\n", call[x].toName->n->function, call[x].count );
-    }
-
-    fprintf( c, "}\n" );
-    fclose( c );
-}
-// ====================================================================================================
-void _itmPumpProcess( char c )
+void _itmPumpProcess( struct RunTime *r, char c )
 
 /* Handle individual characters into the itm decoder */
 
 {
-    struct msg decoded;
 
-    typedef void ( *handlers )( void *decoded, struct ITMDecoder * i );
+    typedef void ( *handlers )( struct RunTime * r );
 
     /* Handlers for each complete message received */
     static const handlers h[MSG_NUM_MSGS] =
@@ -687,7 +357,7 @@ void _itmPumpProcess( char c )
         /* MSG_TS */              NULL
     };
 
-    switch ( ITMPump( &_r.i, c ) )
+    switch ( ITMPump( &r->i, c ) )
     {
         // ------------------------------------
         case ITM_EV_NONE:
@@ -695,17 +365,17 @@ void _itmPumpProcess( char c )
 
         // ------------------------------------
         case ITM_EV_UNSYNCED:
-            genericsReport( V_INFO, "ITM Lost Sync (%d)" EOL, ITMDecoderGetStats( &_r.i )->lostSyncCount );
+            genericsReport( V_INFO, "ITM Lost Sync (%d)" EOL, ITMDecoderGetStats( &r->i )->lostSyncCount );
             break;
 
         // ------------------------------------
         case ITM_EV_SYNCED:
-            genericsReport( V_INFO, "ITM In Sync (%d)" EOL, ITMDecoderGetStats( &_r.i )->syncCount );
+            genericsReport( V_INFO, "ITM In Sync (%d)" EOL, ITMDecoderGetStats( &r->i )->syncCount );
             break;
 
         // ------------------------------------
         case ITM_EV_OVERFLOW:
-            genericsReport( V_WARN, "ITM Overflow (%d)" EOL, ITMDecoderGetStats( &_r.i )->overflow );
+            genericsReport( V_WARN, "ITM Overflow (%d)" EOL, ITMDecoderGetStats( &r->i )->overflow );
             break;
 
         // ------------------------------------
@@ -715,13 +385,13 @@ void _itmPumpProcess( char c )
 
         // ------------------------------------
         case ITM_EV_PACKET_RXED:
-            ITMGetDecodedPacket( &_r.i, &decoded );
+            ITMGetDecodedPacket( &r->i, &r->m );
 
             /* See if we decoded a dispatchable match. genericMsg is just used to access */
             /* the first two members of the decoded structs in a portable way.           */
-            if ( h[decoded.genericMsg.msgtype] )
+            if ( h[r->m.genericMsg.msgtype] )
             {
-                ( h[decoded.genericMsg.msgtype] )( &decoded, &_r.i );
+                ( h[r->m.genericMsg.msgtype] )( r );
             }
 
             break;
@@ -730,27 +400,21 @@ void _itmPumpProcess( char c )
     }
 }
 // ====================================================================================================
-// ====================================================================================================
-// ====================================================================================================
-// Protocol pump for decoding messages
-// ====================================================================================================
-// ====================================================================================================
-// ====================================================================================================
-void _protocolPump( uint8_t c )
+void _protocolPump( struct RunTime *r, uint8_t c )
 
 /* Top level protocol pump */
 
 {
-    if ( options.useTPIU )
+    if ( r->options->useTPIU )
     {
-        switch ( TPIUPump( &_r.t, c ) )
+        switch ( TPIUPump( &r->t, c ) )
         {
             // ------------------------------------
             case TPIU_EV_NEWSYNC:
-                genericsReport( V_INFO, "TPIU In Sync (%d)" EOL, TPIUDecoderGetStats( &_r.t )->syncCount );
+                genericsReport( V_INFO, "TPIU In Sync (%d)" EOL, TPIUDecoderGetStats( &r->t )->syncCount );
 
             case TPIU_EV_SYNCED:
-                ITMDecoderForceSync( &_r.i, true );
+                ITMDecoderForceSync( &r->i, true );
                 break;
 
             // ------------------------------------
@@ -760,28 +424,28 @@ void _protocolPump( uint8_t c )
 
             // ------------------------------------
             case TPIU_EV_UNSYNCED:
-                genericsReport( V_INFO, "TPIU Lost Sync (%d)" EOL, TPIUDecoderGetStats( &_r.t )->lostSync );
-                ITMDecoderForceSync( &_r.i, false );
+                genericsReport( V_INFO, "TPIU Lost Sync (%d)" EOL, TPIUDecoderGetStats( &r->t )->lostSync );
+                ITMDecoderForceSync( &r->i, false );
                 break;
 
             // ------------------------------------
             case TPIU_EV_RXEDPACKET:
-                if ( !TPIUGetPacket( &_r.t, &_r.p ) )
+                if ( !TPIUGetPacket( &r->t, &r->p ) )
                 {
                     genericsReport( V_WARN, "TPIUGetPacket fell over" EOL );
                 }
 
-                for ( uint32_t g = 0; g < _r.p.len; g++ )
+                for ( uint32_t g = 0; g < r->p.len; g++ )
                 {
-                    if ( _r.p.packet[g].s == options.tpiuITMChannel )
+                    if ( r->p.packet[g].s == r->options->tpiuITMChannel )
                     {
-                        _itmPumpProcess( _r.p.packet[g].d );
+                        _itmPumpProcess( r, r->p.packet[g].d );
                         continue;
                     }
 
-                    if ( _r.p.packet[g].s != 0 )
+                    if ( r->p.packet[g].s != 0 )
                     {
-                        genericsReport( V_WARN, "Unknown TPIU channel %02x" EOL, _r.p.packet[g].s );
+                        genericsReport( V_DEBUG, "Unknown TPIU channel %02x" EOL, r->p.packet[g].s );
                     }
                 }
 
@@ -797,76 +461,130 @@ void _protocolPump( uint8_t c )
     else
     {
         /* There's no TPIU in use, so this goes straight to the ITM layer */
-        _itmPumpProcess( c );
+        _itmPumpProcess( r, c );
     }
 }
 // ====================================================================================================
-void _printHelp( char *progName )
+static void _printHelp( struct RunTime *r )
 
 {
-    fprintf( stdout, "Usage: %s <htv> <-e ElfFile> <-m MaxHistory> -r <routines> <-i channel> <-p port> <-s server>" EOL, progName );
-    fprintf( stdout, "       d: <DeleteMaterial> to take off front of filenames" EOL );
-    fprintf( stdout, "       e: <ElfFile> to use for symbols" EOL );
-    fprintf( stdout, "       f: <FileChannel> for file writing (default %d)" EOL, options.fileChannel );
-    fprintf( stdout, "       g: <TraceChannel> for trace output (default %d)" EOL, options.traceChannel );
-    fprintf( stdout, "       h: This help" EOL );
-    fprintf( stdout, "       i: <channel> Set ITM Channel in TPIU decode (defaults to 1)" EOL );
-    fprintf( stdout, "       l: Aggregate per line rather than per function" EOL );
-    fprintf( stdout, "       n: Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)" EOL );
-    fprintf( stdout, "       s: <Server>:<Port> to use" EOL );
-    fprintf( stdout, "       t: Use TPIU decoder" EOL );
-    fprintf( stdout, "       v: <level> Verbose mode 0(errors)..3(debug)" EOL );
-    fprintf( stdout, "       y: <Filename> dotty filename for structured callgraph output" EOL );
-    fprintf( stdout, "       z: <Filename> profile filename for kcachegrind output" EOL );
+    genericsPrintf( "Usage: %s [options]" EOL, r->progName );
+    genericsPrintf( "    -D, --no-demangle:  Switch off C++ symbol demangling" EOL );
+    genericsPrintf( "    -d, --del-prefix:   <String> Material to delete off front of filenames" EOL );
+    genericsPrintf( "    -e, --elf-file:     <ElfFile> to use for symbols" EOL );
+    genericsPrintf( "    -E, --eof:          When reading from file, terminate at end of file rather than waiting for further input" EOL );
+    genericsPrintf( "    -f, --input-file:   <filename>: Take input from specified file" EOL );
+    genericsPrintf( "    -g, --trace-chn:    <TraceChannel> for trace output (default %d)" EOL, r->options->traceChannel );
+    genericsPrintf( "    -h, --help:         This help" EOL );
+    genericsPrintf( "    -I, --interval:     <Interval>: Time to sample (in mS)" EOL );
+    genericsPrintf( "    -n, --itm-sync:     Enforce sync requirement for ITM (i.e. ITM needs to issue syncs)" EOL );
+    genericsPrintf( "    -O, --objdump-opts: <options> Options to pass directly to objdump" EOL );
+    genericsPrintf( "    -s, --server:       <Server>:<Port> to use" EOL );
+    genericsPrintf( "    -t, --tpiu:         <channel>: Use TPIU to strip TPIU on specfied channel (defaults to 1)" EOL );
+    genericsPrintf( "    -T, --all-truncate: truncate -d material off all references (i.e. make output relative)" EOL );
+    genericsPrintf( "    -v, --verbose:      <level> Verbose mode 0(errors)..3(debug)" EOL );
+    genericsPrintf( "    -V, --version:      Print version and exit" EOL );
+    genericsPrintf( "    -y, --graph-file:   <Filename> dotty filename for structured callgraph output" EOL );
+    genericsPrintf( "    -z, --cache-file:   <Filename> profile filename for kcachegrind output" EOL );
+    genericsPrintf( EOL "(Will connect one port higher than that set in -s when TPIU is not used)" EOL );
+
 }
 // ====================================================================================================
-int _processOptions( int argc, char *argv[] )
+void _printVersion( void )
 
 {
-    int c;
+    genericsPrintf( "orbstat version " GIT_DESCRIBE );
+}
+// ====================================================================================================
+static struct option _longOptions[] =
+{
+    {"no-demangle", no_argument, NULL, 'D'},
+    {"del-prefix", required_argument, NULL, 'd'},
+    {"elf-file", required_argument, NULL, 'e'},
+    {"eof", no_argument, NULL, 'E'},
+    {"input-file", required_argument, NULL, 'f'},
+    {"trace-chn", required_argument, NULL, 'g'},
+    {"help", no_argument, NULL, 'h'},
+    {"interval", required_argument, NULL, 'I'},
+    {"itm-sync", no_argument, NULL, 'n'},
+    {"objdump-opts", required_argument, NULL, 'O'},
+    {"server", required_argument, NULL, 's'},
+    {"tpiu", required_argument, NULL, 't'},
+    {"all-truncate", no_argument, NULL, 'T'},
+    {"verbose", required_argument, NULL, 'v'},
+    {"version", no_argument, NULL, 'V'},
+    {"graph-file", required_argument, NULL, 'y'},
+    {"cache-file", required_argument, NULL, 'z'},
+    {NULL, no_argument, NULL, 0}
+};
+// ====================================================================================================
+static bool _processOptions( int argc, char *argv[], struct RunTime *r )
 
-    while ( ( c = getopt ( argc, argv, "d:e:f:g:hi:lnp:s:tv:y:z:" ) ) != -1 )
+{
+    int c, optionIndex = 0;
 
+    while ( ( c = getopt_long ( argc, argv, "Dd:e:Ef:g:hI:nO:s:t:Tv:Vy:z:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
             case 'd':
-                options.deleteMaterial = optarg;
+                r->options->deleteMaterial = optarg;
+                break;
+
+            // ------------------------------------
+            case 'D':
+                r->options->demangle = false;
+                break;
+
+            // ------------------------------------
+            case 'E':
+                r->options->fileTerminate = true;
                 break;
 
             // ------------------------------------
             case 'e':
-                options.elffile = optarg;
+                r->options->elffile = optarg;
                 break;
 
             // ------------------------------------
             case 'f':
-                options.fileChannel = atoi( optarg );
+                r->options->file = optarg;
                 break;
 
             // ------------------------------------
             case 'g':
-                options.traceChannel = atoi( optarg );
+                r->options->traceChannel = atoi( optarg );
                 break;
 
             // ------------------------------------
             case 'h':
-                _printHelp( argv[0] );
+                _printHelp( r );
                 exit( 0 );
 
             // ------------------------------------
-            case 'i':
-                options.tpiuITMChannel = atoi( optarg );
+            case 'V':
+                _printVersion();
+                return false;
+
+            // ------------------------------------
+            case 'I':
+                r->options->sampleDuration = atoi( optarg );
                 break;
 
             // ------------------------------------
             case 'n':
-                options.forceITMSync = false;
+                r->options->forceITMSync = false;
+                break;
+
+            // ------------------------------------
+
+            case 'O':
+                r->options->odoptions = optarg;
                 break;
 
             // ------------------------------------
             case 's':
-                options.server = optarg;
+                r->options->server = optarg;
 
                 // See if we have an optional port number too
                 char *a = optarg;
@@ -879,19 +597,25 @@ int _processOptions( int argc, char *argv[] )
                 if ( *a == ':' )
                 {
                     *a = 0;
-                    options.port = atoi( ++a );
+                    r->options->port = atoi( ++a );
                 }
 
-                if ( !options.port )
+                if ( !r->options->port )
                 {
-                    options.port = SERVER_PORT;
+                    r->options->port = NWCLIENT_SERVER_PORT;
                 }
 
                 break;
 
             // ------------------------------------
+            case 'T':
+                r->options->truncateDeleteMaterial = true;
+                break;
+
+            // ------------------------------------
             case 't':
-                options.useTPIU = true;
+                r->options->tpiuITMChannel = atoi( optarg );
+                r->options->useTPIU = !r->options->useTPIU;
                 break;
 
             // ------------------------------------
@@ -901,12 +625,12 @@ int _processOptions( int argc, char *argv[] )
 
             // ------------------------------------
             case 'y':
-                options.dotfile = optarg;
+                r->options->dotfile = optarg;
                 break;
 
             // ------------------------------------
             case 'z':
-                options.profile = optarg;
+                r->options->profile = optarg;
                 break;
 
             // ------------------------------------
@@ -929,156 +653,211 @@ int _processOptions( int argc, char *argv[] )
                 // ------------------------------------
         }
 
-    if ( ( options.useTPIU ) && ( !options.tpiuITMChannel ) )
-    {
-        genericsReport( V_ERROR, "TPIU set for use but no channel set for ITM output" EOL );
-        return false;
-    }
-
-    if ( !options.elffile )
+    if ( !r->options->elffile )
     {
         genericsReport( V_ERROR, "Elf File not specified" EOL );
         exit( -2 );
     }
 
-    genericsReport( V_INFO, "orbtop V" VERSION " (Git %08X %s, Built " BUILD_DATE ")" EOL, GIT_HASH, ( GIT_DIRTY ? "Dirty" : "Clean" ) );
-
-    genericsReport( V_INFO, "Server        : %s:%d" EOL, options.server, options.port );
-    genericsReport( V_INFO, "Delete Mat    : %s" EOL, options.deleteMaterial ? options.deleteMaterial : "None" );
-    genericsReport( V_INFO, "Elf File      : %s" EOL, options.elffile );
-    genericsReport( V_INFO, "DOT file      : %s" EOL, options.dotfile ? options.dotfile : "None" );
-    genericsReport( V_INFO, "ForceSync     : %s" EOL, options.forceITMSync ? "true" : "false" );
-    genericsReport( V_INFO, "Trace/File Ch : %d/%d" EOL, options.traceChannel, options.fileChannel );
-
-    if ( options.useTPIU )
+    if ( !r->options->sampleDuration )
     {
-        genericsReport( V_INFO, "Using TPIU  : true (ITM on channel %d)" EOL, options.tpiuITMChannel );
+        genericsReport( V_ERROR, "Illegal sample duration" EOL );
+        exit( -2 );
     }
 
+    genericsReport( V_INFO, "orbstat version " GIT_DESCRIBE EOL );
+    genericsReport( V_INFO, "Server          : %s:%d" EOL, r->options->server, r->options->port );
+    genericsReport( V_INFO, "Delete Material : %s" EOL, r->options->deleteMaterial ? r->options->deleteMaterial : "None" );
+    genericsReport( V_INFO, "Elf File        : %s %s" EOL, r->options->elffile, r->options->truncateDeleteMaterial ? "(Truncate)" : "(Don't Truncate)" );
+    genericsReport( V_INFO, "DOT file        : %s" EOL, r->options->dotfile ? r->options->dotfile : "None" );
+    genericsReport( V_INFO, "ForceSync       : %s" EOL, r->options->forceITMSync ? "true" : "false" );
+    genericsReport( V_INFO, "Trace Channel   : %d" EOL, r->options->traceChannel );
+    genericsReport( V_INFO, "Sample Duration : %d mS" EOL, r->options->sampleDuration );
+    genericsReport( V_INFO, "Objdump options  : %s" EOL, r->options->odoptions ? r->options->odoptions : "None" );
     return true;
+}
+// ====================================================================================================
+// ====================================================================================================
+static void _doExit( void )
+
+/* Perform any explicit exit functions */
+
+{
+    _r.ending = true;
+    /* Give them a bit of time, then we're leaving anyway */
+    usleep( 200 );
+}
+// ====================================================================================================
+static void _intHandler( int sig )
+
+/* Catch CTRL-C so things can be cleaned up properly via atexit functions */
+{
+    /* CTRL-C exit is not an error... */
+    _doExit();
 }
 // ====================================================================================================
 int main( int argc, char *argv[] )
 
 {
-    int sockfd;
-    struct sockaddr_in serv_addr;
-    struct hostent *server;
-    uint8_t cbw[TRANSFER_SIZE];
-    uint64_t lastTime;
+    struct Stream *stream = NULL;
+    enum symbolErr r;
+    struct timeval tv;
 
-    ssize_t t;
-    int flag = 1;
+    /* Have a basic name and search string set up */
+    _r.progName = genericsBasename( argv[0] );
 
-    /* Fill in a time to start from */
-    lastTime = _timestamp();
-
-    if ( !_processOptions( argc, argv ) )
+    if ( !_processOptions( argc, argv, &_r ) )
     {
-        exit( -1 );
+        /* processOptions generates its own error messages */
+        genericsExit( -1, "" EOL );
     }
 
-    /* Get the symbols from file */
-    _r.s = SymbolSetCreate( options.elffile );
+    /* Make sure the fifos get removed at the end */
+    atexit( _doExit );
 
-    if ( !_r.s )
+    /* This ensures the atexit gets called */
+    if ( SIG_ERR == signal( SIGINT, _intHandler ) )
     {
-        exit( -3 );
+        genericsExit( -1, "Failed to establish Int handler" EOL );
     }
+
+#if !defined(WIN32)
+
+    /* Don't kill a sub-process when any reader or writer evaporates */
+    if ( SIG_ERR == signal( SIGPIPE, SIG_IGN ) )
+    {
+        genericsExit( -1, "Failed to ignore SIGPIPEs" EOL );
+    }
+
+#endif
 
     /* Reset the TPIU handler before we start */
     TPIUDecoderInit( &_r.t );
-    ITMDecoderInit( &_r.i, options.forceITMSync );
+    ITMDecoderInit( &_r.i, _r.options->forceITMSync );
 
-    sockfd = socket( AF_INET, SOCK_STREAM, 0 );
-    setsockopt( sockfd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof( flag ) );
-
-    if ( sockfd < 0 )
+    while ( !_r.ending )
     {
-        perror( "Error creating socket\n" );
-        return -1;
-    }
-
-    /* Now open the network connection */
-    bzero( ( char * ) &serv_addr, sizeof( serv_addr ) );
-    server = gethostbyname( options.server );
-
-    if ( !server )
-    {
-        perror( "Cannot find host" );
-        return -1;
-    }
-
-    serv_addr.sin_family = AF_INET;
-    bcopy( ( char * )server->h_addr,
-           ( char * )&serv_addr.sin_addr.s_addr,
-           server->h_length );
-    serv_addr.sin_port = htons( options.port );
-
-    if ( connect( sockfd, ( struct sockaddr * ) &serv_addr, sizeof( serv_addr ) ) < 0 )
-    {
-        perror( "Could not connect" );
-        return -1;
-    }
-
-    while ( ( t = read( sockfd, cbw, TRANSFER_SIZE ) ) > 0 )
-    {
-        uint8_t *c = cbw;
-
-        while ( t-- )
+        if ( _r.options->file != NULL )
         {
-            _protocolPump( *c++ );
+            stream = streamCreateFile( _r.options->file );
         }
-
-        if ( _timestamp() - lastTime > TOP_UPDATE_INTERVAL )
+        else
         {
-            lastTime = _timestamp();
-
-            if (  _r.cdCount )
+            while ( 1 )
             {
-                if ( options.dotfile )
+                stream = streamCreateSocket( _r.options->server, _r.options->port );
+
+                if ( stream )
                 {
-                    _outputDot();
+                    break;
                 }
 
-                if ( options.profile )
-                {
-                    _outputProfile();
-                }
-            }
-
-            genericsReport( V_INFO, "%d records processed" EOL, _r.cdCount );
-            /* Now free up this seconds data */
-            free( _r.calls );
-            _r.calls = NULL;
-            _r.cdCount = 0;
-
-            if ( !SymbolSetValid( &_r.s, options.elffile ) )
-            {
-                _flushHash();
-
-                if ( !SymbolSetLoad( &_r.s, options.elffile ) )
-                {
-                    genericsReport( V_ERROR, "Elf file was lost" EOL );
-                    return -1;
-                }
+                perror( "Could not connect" );
+                usleep( 1000000 );
             }
         }
 
-        /* Check to make sure there's not an unexpected TPIU in here */
-        if ( ITMDecoderGetStats( &_r.i )->tpiuSyncCount )
+        /* We need symbols constantly while running ... check they are current */
+        /* We need symbols constantly while running ... lets get them */
+        if ( !SymbolSetValid( &_r.s, _r.options->elffile ) )
         {
-            genericsReport( V_WARN, "Got a TPIU sync while decoding ITM...did you miss a -t option?" EOL );
-            break;
+            r = SymbolSetCreate( &_r.s, _r.options->elffile, _r.options->deleteMaterial, _r.options->demangle, true, true, _r.options->odoptions );
+
+            switch ( r )
+            {
+                case SYMBOL_NOELF:
+                    genericsExit( -1, "Elf file or symbols in it not found" EOL );
+                    break;
+
+                case SYMBOL_NOOBJDUMP:
+                    genericsExit( -1, "No objdump found" EOL );
+                    break;
+
+                case SYMBOL_UNSPECIFIED:
+                    genericsExit( -1, "Unknown error in symbol subsystem" EOL );
+                    break;
+
+                default:
+                    break;
+            }
+
+            genericsReport( V_WARN, "Loaded %s" EOL, _r.options->elffile );
+        }
+
+        /* ----------------------------------------------------------------------------- */
+        /* This is the main active loop...only break out of this when ending or on error */
+        /* ----------------------------------------------------------------------------- */
+        while ( !_r.ending )
+        {
+            /* Each time segment is restricted */
+            tv.tv_sec = 0;
+            tv.tv_usec  = TICK_TIME_MS * 1000;
+
+            enum ReceiveResult result = stream->receive( stream, _r.rawBlock.buffer, TRANSFER_SIZE, &tv, ( size_t * )&_r.rawBlock.fillLevel );
+
+            if ( result != RECEIVE_RESULT_OK )
+            {
+                if ( result == RECEIVE_RESULT_EOF && _r.options->fileTerminate )
+                {
+                    _r.ending = true;
+                }
+                else if ( result == RECEIVE_RESULT_ERROR )
+                {
+                    break;
+                }
+                else
+                {
+                    usleep( 100000 );
+                }
+            }
+
+            /* ...and record the fact that we received some data */
+            _r.intervalBytes += _r.rawBlock.fillLevel;
+
+            /* Pump all of the data through the protocol handler */
+            uint8_t *c = _r.rawBlock.buffer;
+
+            while ( _r.rawBlock.fillLevel > 0 )
+            {
+                _protocolPump( &_r, *c++ );
+                _r.rawBlock.fillLevel--;
+            }
+
+            /* Check to make sure there's not an unexpected TPIU in here */
+            if ( ITMDecoderGetStats( &_r.i )->tpiuSyncCount )
+            {
+                genericsReport( V_WARN, "Got a TPIU sync while decoding ITM...did you miss a -t option?" EOL );
+            }
+
+            /* Update the intervals */
+            if ( ( _r.sampling ) && ( ( genericsTimestampmS() - _r.starttime ) > _r.options->sampleDuration ) )
+            {
+                _r.ending = true;
+            }
+        }
+
+        stream->close( stream );
+        free( stream );
+    }
+
+    /* Data are collected, now process and report */
+    genericsReport( V_WARN, "Received %d raw sample bytes, %ld function changes, %ld distinct addresses" EOL, _r.intervalBytes, HASH_COUNT( _r.subhead ), HASH_COUNT( _r.insthead ) );
+
+    if ( HASH_COUNT( _r.subhead ) )
+    {
+        if ( ext_ff_outputDot( _r.options->dotfile, _r.subhead, _r.s ) )
+        {
+            genericsReport( V_WARN, "Output DOT" EOL );
+        }
+
+        if ( ext_ff_outputProfile( _r.options->profile, _r.options->elffile, _r.options->truncateDeleteMaterial ? _r.options->deleteMaterial : NULL, false,
+                                   _r.tcount - _r.starttcount, _r.insthead, _r.subhead, _r.s ) )
+        {
+            genericsReport( V_WARN, "Output Profile" EOL );
         }
     }
 
-    if ( ( !ITMDecoderGetStats( &_r.i )->tpiuSyncCount ) )
-    {
-        genericsReport( V_ERROR, "Read failed" EOL );
-    }
-
-    close( sockfd );
-    return -2;
+    return OK;
 }
+
 // ====================================================================================================
