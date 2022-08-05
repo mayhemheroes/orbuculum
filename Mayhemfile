@@ -1,5 +1,5 @@
 project: orbuculum
-target: orbstat
+target: orbmortem
 
 cmds:
-  - cmd: /orbstat -e @@
+  - cmd: /orbmortem -e @@
