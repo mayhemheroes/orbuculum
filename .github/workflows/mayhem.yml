@@ -56,4 +56,4 @@ jobs:
         uses: ForAllSecure/mcode-action@long-runs
         with:
           mayhem-token: ${{ secrets.MAYHEM_TOKEN }}
-          args: --image ${{ steps.meta.outputs.tags }}
+          args: --file Mayhemfile --image ${{ steps.meta.outputs.tags }}
