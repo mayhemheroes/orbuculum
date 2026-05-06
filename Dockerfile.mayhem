@@ -1,14 +1,18 @@
-FROM --platform=linux/amd64 ubuntu:20.04 as builder
+FROM --platform=linux/amd64 ubuntu:22.04 AS builder
 
 RUN apt-get update
-RUN DEBIAN_FRONTEND=noninteractive apt-get install -y libusb-1.0-0-dev libbfd-dev libelf-dev libftdi1-dev git libiberty-dev build-essential libncurses-dev libzmq3-dev
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    libusb-1.0-0-dev libbfd-dev libelf-dev libftdi1-dev git libiberty-dev \
+    build-essential libncurses-dev libzmq3-dev libcapstone-dev \
+    ninja-build python3 python3-pip pkg-config
+RUN pip3 install meson>=0.63
 
 COPY . /repo
 WORKDIR /repo
-RUN make get_version
-RUN make 
+RUN meson setup build --buildtype=release
+RUN ninja -C build
 
-FROM ubuntu:20.04 as package
+FROM ubuntu:22.04 AS package
 RUN apt-get update
 RUN DEBIAN_FRONTEND=noninteractive apt-get install -y libbfd-dev binutils-arm-none-eabi
-COPY --from=builder /repo/ofiles/orbmortem /
+COPY --from=builder /repo/build/orbmortem /
